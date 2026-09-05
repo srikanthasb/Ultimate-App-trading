@@ -1,0 +1,137 @@
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+
+- stage: Validate
+  displayName: Stage 1 - Validate Application
+
+  jobs:
+
+  - job: ValidatePython
+    displayName: Validate Python Application
+
+    steps:
+
+    - task: UsePythonVersion@0
+      displayName: Use Python 3.12
+      inputs:
+        versionSpec: '3.12'
+
+    - script: |
+        python --version
+        python -m pip install --upgrade pip
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Python setup failed"
+          exit 1
+        fi
+      displayName: Setup Python
+
+    - script: |
+        python -m pip install -r requirements.txt
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Dependency installation failed"
+          exit 1
+        fi
+      displayName: Install Dependencies
+
+    - script: |
+        python -m compileall -q app.py src
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Python source validation failed"
+          exit 1
+        fi
+      displayName: Validate Application
+
+
+- stage: DockerBuild
+  displayName: Stage 2 - Build Docker Image
+
+  dependsOn: Validate
+
+  condition: succeeded()
+
+  jobs:
+
+  - job: BuildImage
+    displayName: Build AI Investment App Docker Image
+
+    steps:
+
+    - script: |
+        docker --version
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Docker is not available"
+          exit 1
+        fi
+      displayName: Check Docker
+
+    - script: |
+        docker build -t ai-investment-app:latest .
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Docker image build failed"
+          exit 1
+        fi
+      displayName: Build Docker Image
+
+
+- stage: PushToACR
+  displayName: Stage 3 - Push Docker Image to ACR
+
+  dependsOn: DockerBuild
+
+  condition: succeeded()
+
+  jobs:
+
+  - job: PushImage
+    displayName: Push AI Investment App Image
+
+    pool:
+      vmImage: ubuntu-latest
+
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: Login to Azure and Push Image
+      inputs:
+        azureSubscription: 'sc-finance-app-azure'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          set -e
+
+          echo "Logging into Azure Container Registry..."
+
+          if ! az acr login --name acrfinanceapp1; then
+            echo "ERROR: ACR login failed"
+            exit 1
+          fi
+
+          echo "Building Docker image..."
+
+          if ! docker build \
+            -t acrfinanceapp1.azurecr.io/ai-investment-app:$(Build.BuildId) \
+            .; then
+            echo "ERROR: Docker image build failed"
+            exit 1
+          fi
+
+          echo "Pushing Docker image..."
+
+          if ! docker push \
+            acrfinanceapp1.azurecr.io/ai-investment-app:$(Build.BuildId); then
+            echo "ERROR: Docker image push failed"
+            exit 1
+          fi
+
+          echo "Image pushed successfully."
+
+          echo "Image:"
+          echo "acrfinanceapp1.azurecr.io/ai-investment-app:$(Build.BuildId)"

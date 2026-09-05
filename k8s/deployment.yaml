@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-investment-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-investment-app
+  template:
+    metadata:
+      labels:
+        app: ai-investment-app
+    spec:
+      containers:
+        - name: ai-investment-app
+          image: acrfinanceapp1.azurecr.io/ai-investment-app:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: UPSTOX_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ai-investment-secrets
+                  key: UPSTOX_ACCESS_TOKEN
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-investment-secrets
+                  key: GROQ_API_KEY
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
