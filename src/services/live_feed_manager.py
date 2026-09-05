@@ -4,7 +4,10 @@ import threading
 from datetime import datetime, timezone
 
 from src.data.candle_engine import CandleEngine
-from src.data.historical_candle_loader import load_historical_candles
+from src.data.historical_candle_loader import (
+    load_historical_candles,
+    refresh_intraday_candles,
+)
 from src.data.live_candle_store import LiveCandleStore
 from src.services.live_analysis_service import LiveAnalysisService
 
@@ -56,7 +59,6 @@ class LiveFeedManager:
 
         self.selected_interval: str | None = None
 
-        # Only intervals actually requested by the user are created.
         self.candle_engines: dict[str, CandleEngine] = {}
         self.candle_stores: dict[str, LiveCandleStore] = {}
 
@@ -96,16 +98,18 @@ class LiveFeedManager:
         Load one timeframe without holding the manager lock while waiting
         for broker HTTP requests.
 
-        This is important: the WebSocket can receive the current LTP while
-        historical candles are loading. The latest tick is replayed into the
-        new CandleEngine once the historical bootstrap completes.
+        Historical data is the critical path. It gives us enough candles
+        for immediate indicators/strategies/AI without waiting for the
+        optional current-day intraday endpoint.
         """
         interval = self.validate_interval(interval)
 
         with self._lock:
             if interval in self.candle_engines:
                 return
+
             generation = self._bootstrap_generation
+
             if not self.running:
                 return
 
@@ -114,8 +118,7 @@ class LiveFeedManager:
         print(f"LOADING TIMEFRAME: {interval}")
         print("-" * 70)
 
-        # IMPORTANT: network I/O happens outside self._lock.
-        store = load_historical_candles(
+        live_store = load_historical_candles(
             symbol=self.symbol,
             instrument_key=self.instrument_key,
             interval=interval,
@@ -129,37 +132,115 @@ class LiveFeedManager:
             self.instrument_key,
         )
 
-        live_store = LiveCandleStore(self.max_candles)
-
-        for candle in store.get_candles():
-            live_store.add_candle(candle)
-
         with self._lock:
-            # Session may have been stopped/restarted while HTTP was running.
-            if not self.running or generation != self._bootstrap_generation:
+            if (
+                not self.running
+                or generation != self._bootstrap_generation
+            ):
                 return
 
-            latest_tick = dict(self.latest_tick) if self.latest_tick else None
+            latest_tick = (
+                dict(self.latest_tick)
+                if self.latest_tick
+                else None
+            )
 
             self.candle_engines[interval] = engine
+
+            # IMPORTANT OPTIMIZATION:
+            # The loader already returns a prepared LiveCandleStore.
+            # Do not copy historical candles one-by-one with add_candle().
             self.candle_stores[interval] = live_store
 
-        print(f"Loaded {live_store.count()} completed {interval} candles.")
+        print(
+            f"Loaded {live_store.count()} completed "
+            f"{interval} candles."
+        )
 
-        # Replay the newest live tick after installing the engine.
+        # Replay the newest live tick so the current forming candle
+        # becomes available immediately.
         if latest_tick:
             completed = engine.update(
                 price=latest_tick["price"],
                 timestamp_ms=latest_tick["timestamp_ms"],
                 quantity=latest_tick["quantity"],
             )
+
             if completed:
                 with self._lock:
-                    if self.running and generation == self._bootstrap_generation:
+                    if (
+                        self.running
+                        and generation == self._bootstrap_generation
+                    ):
                         live_store.add_candle(completed)
-                        self.latest_completed_candles[interval] = completed
+                        self.latest_completed_candles[
+                            interval
+                        ] = completed
 
-        print(f"Timeframe {interval} ready.")
+        print(f"Timeframe {interval} ready from historical data.")
+
+        # Intraday data is supplemental and must not delay chart readiness
+        # or initial analysis.
+        def refresh_intraday():
+            try:
+                added = refresh_intraday_candles(
+                    symbol=self.symbol,
+                    interval=interval,
+                    instrument_key=self.instrument_key,
+                    store=live_store,
+                    max_candles=self.max_candles,
+                )
+
+                with self._lock:
+                    valid = (
+                        self.running
+                        and generation == self._bootstrap_generation
+                        and self.candle_stores.get(interval) is live_store
+                    )
+
+                    current_price = (
+                        self.latest_tick["price"]
+                        if self.latest_tick
+                        else None
+                    )
+
+                    should_analyze = (
+                        valid
+                        and self.selected_interval == interval
+                    )
+
+                    if should_analyze and added > 0:
+                        self._run_analysis(
+                            current_price=current_price
+                        )
+
+                    callback = (
+                        self.on_bootstrap_complete
+                        if valid
+                        else None
+                    )
+
+                if callback and added > 0:
+                    try:
+                        callback()
+                    except Exception as exc:
+                        print(
+                            "INTRADAY UPDATE CALLBACK ERROR: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            except Exception as exc:
+                print(
+                    "BACKGROUND INTRADAY REFRESH ERROR: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        threading.Thread(
+            target=refresh_intraday,
+            name=f"IntradayRefresh-{interval}",
+            daemon=True,
+        ).start()
+
         print("-" * 70)
         print()
 
@@ -168,15 +249,11 @@ class LiveFeedManager:
     # ================================================================
 
     def start(self, interval: str = "1m"):
-        """
-        Start immediately and bootstrap the selected timeframe in the
-        background. Historical analysis still runs as soon as the bootstrap
-        completes, while the WebSocket can deliver the current LTP meanwhile.
-        """
         interval = self.validate_interval(interval)
 
         with self._lock:
             self._bootstrap_generation += 1
+
             self.candle_engines.clear()
             self.candle_stores.clear()
             self.latest_completed_candles = {}
@@ -200,6 +277,7 @@ class LiveFeedManager:
         print(f"Instrument      : {self.instrument_key}")
         print(f"Selected        : {interval}")
         print("Startup policy   : background historical bootstrap")
+        print("Store bootstrap  : bulk LiveCandleStore load")
         print("=" * 70)
 
         def bootstrap():
@@ -207,8 +285,12 @@ class LiveFeedManager:
                 self._load_interval(interval)
 
                 with self._lock:
-                    if not self.running or generation != self._bootstrap_generation:
+                    if (
+                        not self.running
+                        or generation != self._bootstrap_generation
+                    ):
                         return
+
                     self._run_analysis(
                         current_price=(
                             self.latest_tick["price"]
@@ -216,6 +298,7 @@ class LiveFeedManager:
                             else None
                         )
                     )
+
                     callback = self.on_bootstrap_complete
 
                 if callback:
@@ -223,18 +306,23 @@ class LiveFeedManager:
                         callback()
                     except Exception as exc:
                         print(
-                            f"BOOTSTRAP CALLBACK ERROR: "
+                            "BOOTSTRAP CALLBACK ERROR: "
                             f"{type(exc).__name__}: {exc}"
                         )
 
             except Exception as exc:
                 with self._lock:
-                    if self.running and generation == self._bootstrap_generation:
+                    if (
+                        self.running
+                        and generation == self._bootstrap_generation
+                    ):
                         self.analysis_error = (
-                            f"Bootstrap {type(exc).__name__}: {exc}"
+                            f"Bootstrap "
+                            f"{type(exc).__name__}: {exc}"
                         )
+
                 print(
-                    f"HISTORICAL BOOTSTRAP ERROR: "
+                    "HISTORICAL BOOTSTRAP ERROR: "
                     f"{type(exc).__name__}: {exc}"
                 )
 
@@ -261,15 +349,23 @@ class LiveFeedManager:
             self.analysis_error = None
 
             already_loaded = interval in self.candle_engines
-            latest_price = self.latest_tick["price"] if self.latest_tick else None
+
+            latest_price = (
+                self.latest_tick["price"]
+                if self.latest_tick
+                else None
+            )
+
             generation = self._bootstrap_generation
 
         if not already_loaded:
-            # Load outside the manager lock so live ticks keep flowing.
             self._load_interval(interval)
 
         with self._lock:
-            if not self.running or generation != self._bootstrap_generation:
+            if (
+                not self.running
+                or generation != self._bootstrap_generation
+            ):
                 return {
                     "changed": old_interval != interval,
                     "old_interval": old_interval,
@@ -312,7 +408,6 @@ class LiveFeedManager:
 
             completed: dict[str, dict] = {}
 
-            # Only loaded intervals receive the tick.
             for interval, engine in self.candle_engines.items():
                 candle = engine.update(
                     price,
@@ -325,7 +420,6 @@ class LiveFeedManager:
 
             for interval, candle in completed.items():
                 store = self.candle_stores[interval]
-
                 store.add_candle(candle)
 
                 self.latest_completed_candles[
@@ -333,9 +427,7 @@ class LiveFeedManager:
                 ] = candle
 
             if self.selected_interval in completed:
-                self._run_analysis(
-                    current_price=price
-                )
+                self._run_analysis(current_price=price)
 
             return completed
 
@@ -343,18 +435,13 @@ class LiveFeedManager:
     # ANALYSIS
     # ================================================================
 
-    def _run_analysis(
-        self,
-        current_price: float | None = None,
-    ):
+    def _run_analysis(self, current_price: float | None = None):
         interval = self.selected_interval
 
         if not interval:
             return None
 
-        store = self.candle_stores.get(
-            interval
-        )
+        store = self.candle_stores.get(interval)
 
         if not store:
             return None
@@ -376,13 +463,9 @@ class LiveFeedManager:
             )
 
             self.latest_analysis = result
-
-            self.last_analysis_at = (
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-            )
-
+            self.last_analysis_at = datetime.now(
+                timezone.utc
+            ).isoformat()
             self.analysis_error = None
 
             return result
@@ -403,10 +486,7 @@ class LiveFeedManager:
     # CANDLES
     # ================================================================
 
-    def get_candles(
-        self,
-        interval: str | None = None,
-    ):
+    def get_candles(self, interval: str | None = None):
         with self._lock:
             i = self.validate_interval(
                 interval or self.selected_interval
@@ -423,10 +503,7 @@ class LiveFeedManager:
     # DATAFRAME
     # ================================================================
 
-    def get_dataframe(
-        self,
-        interval: str | None = None,
-    ):
+    def get_dataframe(self, interval: str | None = None):
         with self._lock:
             i = self.validate_interval(
                 interval or self.selected_interval
@@ -443,10 +520,7 @@ class LiveFeedManager:
     # CURRENT CANDLE
     # ================================================================
 
-    def get_current_candle(
-        self,
-        interval: str | None = None,
-    ):
+    def get_current_candle(self, interval: str | None = None):
         with self._lock:
             i = self.validate_interval(
                 interval or self.selected_interval
@@ -490,30 +564,19 @@ class LiveFeedManager:
                 "symbol": self.symbol,
                 "instrument_key": self.instrument_key,
                 "selected_interval": self.selected_interval,
-
-                # This now shows only timeframes actually loaded.
                 "candle_counts": {
                     interval: store.count()
-                    for interval, store
-                    in self.candle_stores.items()
+                    for interval, store in self.candle_stores.items()
                 },
-
                 "loaded_intervals": list(
                     self.candle_stores.keys()
                 ),
-
                 "latest_tick": self.latest_tick,
-
                 "analysis_available": (
                     self.latest_analysis is not None
                 ),
-
                 "analysis_error": self.analysis_error,
-
-                "last_analysis_at": (
-                    self.last_analysis_at
-                ),
-
+                "last_analysis_at": self.last_analysis_at,
                 "started_at": self.started_at,
             }
 

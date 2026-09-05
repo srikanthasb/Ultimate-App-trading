@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
+import time as _time
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from src.data.live_candle_store import LiveCandleStore
@@ -32,8 +32,7 @@ SUPPORTED_INTERVALS = {
 }
 
 # Short-lived cache avoids repeating the same broker requests when a user
-# switches timeframes and immediately switches back. Intraday data is kept
-# intentionally short-lived because it changes during market hours.
+# switches timeframes and immediately switches back.
 _CANDLE_CACHE: dict[tuple[str, str], tuple[float, list[dict]]] = {}
 _CACHE_TTL_SECONDS = 10
 _CACHE_LOCK = __import__("threading").RLock()
@@ -42,6 +41,7 @@ _CACHE_LOCK = __import__("threading").RLock()
 def _get_headers() -> dict:
     if not UPSTOX_ACCESS_TOKEN:
         raise RuntimeError("UPSTOX_ACCESS_TOKEN is missing from .env")
+
     return {
         "Accept": "application/json",
         "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
@@ -49,7 +49,26 @@ def _get_headers() -> dict:
 
 
 def _request_json(url: str) -> dict:
-    response = requests.get(url, headers=_get_headers(), timeout=8)
+    """
+    Make an Upstox HTTP request.
+
+    Timing is intentionally measured here so we can determine whether
+    the remaining startup delay is caused by the broker/network.
+    """
+    request_started = _time.perf_counter()
+
+    response = requests.get(
+        url,
+        headers=_get_headers(),
+        timeout=8,
+    )
+
+    request_elapsed = _time.perf_counter() - request_started
+
+    print(
+        f"[HTTP] completed in {request_elapsed:.3f} sec "
+        f"(HTTP {response.status_code})"
+    )
 
     if response.status_code != 200:
         raise RuntimeError(
@@ -78,8 +97,25 @@ def _fetch_historical(
         f"{UPSTOX_HISTORICAL_URL}/{instrument_key}/"
         f"{unit}/{interval}/{to_date}/{from_date}"
     )
+
     print(f"[HISTORICAL] {url}")
-    return _request_json(url).get("data", {}).get("candles", [])
+
+    started = _time.perf_counter()
+
+    candles = _request_json(url).get(
+        "data", {}
+    ).get(
+        "candles", []
+    )
+
+    elapsed = _time.perf_counter() - started
+
+    print(
+        f"[HISTORICAL] received {len(candles)} candles "
+        f"in {elapsed:.3f} sec"
+    )
+
+    return candles
 
 
 def _fetch_intraday(
@@ -91,14 +127,35 @@ def _fetch_intraday(
         f"{UPSTOX_INTRADAY_URL}/{instrument_key}/"
         f"{unit}/{interval}"
     )
+
     print(f"[INTRADAY]  {url}")
-    return _request_json(url).get("data", {}).get("candles", [])
+
+    started = _time.perf_counter()
+
+    candles = _request_json(url).get(
+        "data", {}
+    ).get(
+        "candles", []
+    )
+
+    elapsed = _time.perf_counter() - started
+
+    print(
+        f"[INTRADAY] received {len(candles)} candles "
+        f"in {elapsed:.3f} sec"
+    )
+
+    return candles
 
 
 def _parse_timestamp(timestamp) -> datetime:
-    parsed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(
+        str(timestamp).replace("Z", "+00:00")
+    )
+
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=IST)
+
     return parsed.astimezone(UTC)
 
 
@@ -109,7 +166,9 @@ def _convert_candle(
     instrument_key: str,
 ) -> dict:
     if len(candle) < 6:
-        raise ValueError(f"Invalid Upstox candle: {candle}")
+        raise ValueError(
+            f"Invalid Upstox candle: {candle}"
+        )
 
     return {
         "symbol": symbol,
@@ -124,26 +183,38 @@ def _convert_candle(
     }
 
 
-def _combine_and_deduplicate(candles: list[dict]) -> list[dict]:
+def _combine_and_deduplicate(
+    candles: list[dict],
+) -> list[dict]:
     by_timestamp: dict[str, dict] = {}
 
     for candle in candles:
-        ts = _parse_timestamp(candle["timestamp"]).isoformat()
+        ts = _parse_timestamp(
+            candle["timestamp"]
+        ).isoformat()
+
         item = candle.copy()
         item["timestamp"] = ts
-        # Intraday candles are added after historical candles, so today's
-        # version wins if the two sources overlap.
+
+        # Intraday candles are added after historical candles,
+        # so today's version wins if the two sources overlap.
         by_timestamp[ts] = item
 
     result = list(by_timestamp.values())
-    result.sort(key=lambda c: _parse_timestamp(c["timestamp"]))
+
+    result.sort(
+        key=lambda c: _parse_timestamp(c["timestamp"])
+    )
+
     return result
 
 
 def _market_is_open(now: datetime) -> bool:
     now = now.astimezone(IST)
+
     if now.weekday() >= 5:
         return False
+
     return time(9, 15) <= now.time() < time(15, 30)
 
 
@@ -151,10 +222,15 @@ def _current_bucket_start(
     interval: str,
     now: datetime | None = None,
 ) -> datetime | None:
-    """Return the start of the currently forming NSE candle, if market is open."""
+    """
+    Return the start of the currently forming NSE candle,
+    if the market is open.
+    """
     now = now or datetime.now(IST)
+
     if now.tzinfo is None:
         now = now.replace(tzinfo=IST)
+
     now = now.astimezone(IST)
 
     if not _market_is_open(now):
@@ -168,8 +244,13 @@ def _current_bucket_start(
         size = int(interval.removesuffix("m"))
 
     now_minutes = now.hour * 60 + now.minute
+
     elapsed = now_minutes - session_start
-    bucket = session_start + (elapsed // size) * size
+
+    bucket = (
+        session_start
+        + (elapsed // size) * size
+    )
 
     return now.replace(
         hour=bucket // 60,
@@ -178,6 +259,161 @@ def _current_bucket_start(
         microsecond=0,
     )
 
+
+def _cache_get(
+    cache_key: tuple[str, str],
+):
+    now_epoch = _time.monotonic()
+
+    with _CACHE_LOCK:
+        cached = _CANDLE_CACHE.get(cache_key)
+
+        if (
+            cached
+            and now_epoch - cached[0]
+            < _CACHE_TTL_SECONDS
+        ):
+            return [
+                c.copy()
+                for c in cached[1]
+            ]
+
+    return None
+
+
+def _cache_put(
+    cache_key: tuple[str, str],
+    candles: list[dict],
+    now_epoch: float,
+):
+    with _CACHE_LOCK:
+        _CANDLE_CACHE[cache_key] = (
+            now_epoch,
+            [
+                c.copy()
+                for c in candles
+            ],
+        )
+
+
+def _prepare_completed_candles(
+    symbol: str,
+    interval: str,
+    instrument_key: str,
+    raw_candles: list,
+    max_candles: int,
+    now_ist: datetime,
+) -> list[dict]:
+    """
+    Convert, deduplicate, remove the currently-forming candle,
+    and retain the requested number of completed candles.
+
+    Timing is included so we can distinguish API latency from
+    local Python processing time.
+    """
+    started = _time.perf_counter()
+
+    converted: list[dict] = []
+
+    for raw in raw_candles:
+        try:
+            converted.append(
+                _convert_candle(
+                    symbol,
+                    interval,
+                    raw,
+                    instrument_key,
+                )
+            )
+        except Exception as exc:
+            print(
+                f"Skipping invalid candle {raw}: {exc}"
+            )
+
+    conversion_elapsed = (
+        _time.perf_counter() - started
+    )
+
+    if not converted:
+        print(
+            f"[PROCESSING] conversion: "
+            f"{conversion_elapsed:.3f} sec"
+        )
+        return []
+
+    combine_started = _time.perf_counter()
+
+    candles = _combine_and_deduplicate(
+        converted
+    )
+
+    combine_elapsed = (
+        _time.perf_counter()
+        - combine_started
+    )
+
+    # Remove only the currently-forming bucket.
+    # Do not blindly discard the newest row,
+    # especially after market close or on weekends.
+    current_bucket = _current_bucket_start(
+        interval,
+        now_ist,
+    )
+
+    completed = []
+    removed = 0
+
+    for candle in candles:
+        candle_dt = _parse_timestamp(
+            candle["timestamp"]
+        )
+
+        if (
+            current_bucket
+            and candle_dt
+            == current_bucket.astimezone(UTC)
+        ):
+            removed += 1
+            continue
+
+        completed.append(candle)
+
+    filtering_elapsed = (
+        _time.perf_counter()
+        - combine_started
+        - combine_elapsed
+    )
+
+    total_elapsed = (
+        _time.perf_counter()
+        - started
+    )
+
+    print(
+        f"[PROCESSING] conversion : "
+        f"{conversion_elapsed:.3f} sec"
+    )
+
+    print(
+        f"[PROCESSING] combine     : "
+        f"{combine_elapsed:.3f} sec"
+    )
+
+    print(
+        f"[PROCESSING] filtering   : "
+        f"{filtering_elapsed:.3f} sec"
+    )
+
+    print(
+        f"[PROCESSING] total       : "
+        f"{total_elapsed:.3f} sec"
+    )
+
+    print(
+        f"Current candle removed: {removed}"
+    )
+
+    return completed[-max_candles:]
 
 
 def load_historical_candles(
@@ -188,33 +424,57 @@ def load_historical_candles(
     instrument_key: str | None = None,
 ) -> LiveCandleStore:
     """
-    Fast bootstrap for one exact instrument/timeframe.
+    Fast historical bootstrap for one exact instrument/timeframe.
 
-    Historical previous-day candles and today's intraday candles are fetched
-    concurrently. This preserves immediate analysis AND gives the chart the
-    current trading day's completed candles. A short-lived cache avoids
-    duplicate broker calls during quick timeframe switches.
+    IMPORTANT:
+    The historical request is the critical path because it provides
+    enough candles for immediate indicators/strategies/AI.
+
+    Today's intraday request is deliberately NOT awaited here.
+    It is refreshed asynchronously by the LiveFeedManager after the
+    historical store is installed.
+
+    Timing instrumentation in this function allows us to determine
+    exactly where startup time is being spent.
     """
+    bootstrap_started = _time.perf_counter()
+
     if not symbol or not symbol.strip():
         raise ValueError("Symbol is required.")
+
     if not instrument_key or not instrument_key.strip():
-        raise ValueError("instrument_key is required.")
+        raise ValueError(
+            "instrument_key is required."
+        )
+
     if interval not in SUPPORTED_INTERVALS:
         raise ValueError(
             f"Unsupported interval '{interval}'. "
-            f"Supported intervals: {list(SUPPORTED_INTERVALS)}"
+            f"Supported intervals: "
+            f"{list(SUPPORTED_INTERVALS)}"
         )
+
     if max_candles <= 0:
-        raise ValueError("max_candles must be greater than 0.")
+        raise ValueError(
+            "max_candles must be greater than 0."
+        )
 
     symbol = symbol.strip().upper()
     instrument_key = instrument_key.strip()
 
     try:
         requested_days = (
-            max(1, int(period[:-1])) if period.endswith("d") else 5
+            max(
+                1,
+                int(period[:-1]),
+            )
+            if period.endswith("d")
+            else 5
         )
-    except (ValueError, TypeError):
+    except (
+        ValueError,
+        TypeError,
+    ):
         requested_days = 5
 
     minimum_days = {
@@ -226,126 +486,390 @@ def load_historical_candles(
         "30m": 15,
         "1h": 20,
     }[interval]
-    requested_days = max(requested_days, minimum_days)
+
+    requested_days = max(
+        requested_days,
+        minimum_days,
+    )
 
     now_ist = datetime.now(IST)
+
     today = now_ist.date()
     yesterday = today - timedelta(days=1)
-    historical_start = today - timedelta(days=requested_days)
+
+    historical_start = (
+        today
+        - timedelta(days=requested_days)
+    )
+
     cfg = SUPPORTED_INTERVALS[interval]
-    cache_key = (instrument_key, interval)
+
+    cache_key = (
+        instrument_key,
+        interval,
+    )
 
     print()
     print("=" * 70)
-    print("FAST UPSTOX CANDLE BOOTSTRAP")
+    print("FAST UPSTOX HISTORICAL BOOTSTRAP")
     print("=" * 70)
-    print(f"Symbol              : {symbol}")
-    print(f"Instrument           : {instrument_key}")
-    print(f"Interval             : {interval}")
-    print(f"Historical from      : {historical_start.isoformat()}")
-    print(f"Historical to        : {yesterday.isoformat()}")
-    print(f"Intraday              : {today.isoformat()}")
 
-    # Cache completed+intraday candles briefly.
-    import time as _time
-    now_epoch = _time.monotonic()
-    with _CACHE_LOCK:
-        cached = _CANDLE_CACHE.get(cache_key)
-        if cached and now_epoch - cached[0] < _CACHE_TTL_SECONDS:
-            candles = [c.copy() for c in cached[1]]
-            print("Cache hit            : yes")
-        else:
-            candles = None
+    print(
+        f"Symbol              : {symbol}"
+    )
 
-    if candles is None:
-        # These two requests are independent. Parallelizing them preserves
-        # both data sources while cutting startup latency roughly to the
-        # slower request rather than the sum of both requests.
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            historical_future = executor.submit(
-                _fetch_historical,
-                instrument_key,
-                cfg["unit"],
-                cfg["interval"],
-                yesterday.isoformat(),
-                historical_start.isoformat(),
-            )
-            intraday_future = executor.submit(
-                _fetch_intraday,
-                instrument_key,
-                cfg["unit"],
-                cfg["interval"],
-            )
+    print(
+        f"Instrument           : "
+        f"{instrument_key}"
+    )
 
-            historical_raw = historical_future.result()
-            intraday_raw = intraday_future.result()
+    print(
+        f"Interval             : {interval}"
+    )
 
-        print(f"Historical candles   : {len(historical_raw)}")
-        print(f"Intraday candles     : {len(intraday_raw)}")
+    print(
+        f"Historical from      : "
+        f"{historical_start.isoformat()}"
+    )
 
-        converted: list[dict] = []
+    print(
+        f"Historical to        : "
+        f"{yesterday.isoformat()}"
+    )
 
-        for raw in historical_raw:
-            try:
-                converted.append(
-                    _convert_candle(symbol, interval, raw, instrument_key)
-                )
-            except Exception as exc:
-                print(f"Skipping invalid historical candle {raw}: {exc}")
+    print(
+        "Intraday refresh     : "
+        "background (not startup critical)"
+    )
 
-        for raw in intraday_raw:
-            try:
-                converted.append(
-                    _convert_candle(symbol, interval, raw, instrument_key)
-                )
-            except Exception as exc:
-                print(f"Skipping invalid intraday candle {raw}: {exc}")
+    # ---------------------------------------------------------------
+    # CACHE
+    # ---------------------------------------------------------------
 
-        if not converted:
-            raise ValueError(
-                f"No valid candles returned by Upstox for {symbol} {interval}."
-            )
+    cache_started = _time.perf_counter()
 
-        candles = _combine_and_deduplicate(converted)
+    candles = _cache_get(
+        cache_key
+    )
 
-        # Do not remove the newest row blindly. Remove only the exact bucket
-        # that is currently forming, and only while NSE is open.
-        current_bucket = _current_bucket_start(interval, now_ist)
-        completed = []
-        removed = 0
+    cache_elapsed = (
+        _time.perf_counter()
+        - cache_started
+    )
 
-        for candle in candles:
-            candle_dt = _parse_timestamp(candle["timestamp"])
-            if current_bucket and candle_dt == current_bucket.astimezone(UTC):
-                removed += 1
-                continue
-            completed.append(candle)
-
-        candles = completed[-max_candles:]
-
-        with _CACHE_LOCK:
-            _CANDLE_CACHE[cache_key] = (
-                now_epoch,
-                [c.copy() for c in candles],
-            )
-
-        print(f"Current candle removed: {removed}")
-    else:
-        print(f"Cache candles        : {len(candles)}")
-
-    if not candles:
-        raise ValueError(
-            f"No completed candles available for {symbol} {interval}."
+    if candles is not None:
+        print(
+            f"Cache hit            : yes "
+            f"({cache_elapsed:.3f} sec)"
         )
 
-    print(f"Final completed      : {len(candles)}")
-    print(f"Final first          : {candles[0]['timestamp']}")
-    print(f"Final last           : {candles[-1]['timestamp']}")
+    else:
+        print(
+            f"Cache hit            : no "
+            f"({cache_elapsed:.3f} sec)"
+        )
+
+        # -----------------------------------------------------------
+        # HISTORICAL API
+        # -----------------------------------------------------------
+
+        historical_started = (
+            _time.perf_counter()
+        )
+
+        raw = _fetch_historical(
+            instrument_key,
+            cfg["unit"],
+            cfg["interval"],
+            yesterday.isoformat(),
+            historical_start.isoformat(),
+        )
+
+        historical_elapsed = (
+            _time.perf_counter()
+            - historical_started
+        )
+
+        print(
+            f"Historical candles   : "
+            f"{len(raw)}"
+        )
+
+        print(
+            f"[TIMING] Historical stage: "
+            f"{historical_elapsed:.3f} sec"
+        )
+
+        # -----------------------------------------------------------
+        # LOCAL PROCESSING
+        # -----------------------------------------------------------
+
+        processing_started = (
+            _time.perf_counter()
+        )
+
+        candles = _prepare_completed_candles(
+            symbol=symbol,
+            interval=interval,
+            instrument_key=instrument_key,
+            raw_candles=raw,
+            max_candles=max_candles,
+            now_ist=now_ist,
+        )
+
+        processing_elapsed = (
+            _time.perf_counter()
+            - processing_started
+        )
+
+        print(
+            f"[TIMING] Local processing: "
+            f"{processing_elapsed:.3f} sec"
+        )
+
+        if not candles:
+            raise ValueError(
+                f"No valid historical candles "
+                f"returned by Upstox for "
+                f"{symbol} {interval}."
+            )
+
+        _cache_put(
+            cache_key,
+            candles,
+            _time.monotonic(),
+        )
+
+    # ---------------------------------------------------------------
+    # FINAL DATASET
+    # ---------------------------------------------------------------
+
+    print(
+        f"Final completed      : "
+        f"{len(candles)}"
+    )
+
+    print(
+        f"Final first          : "
+        f"{candles[0]['timestamp']}"
+    )
+
+    print(
+        f"Final last           : "
+        f"{candles[-1]['timestamp']}"
+    )
+
+    bootstrap_elapsed = (
+        _time.perf_counter()
+        - bootstrap_started
+    )
+
+    print(
+        f"[TIMING] TOTAL historical "
+        f"bootstrap: "
+        f"{bootstrap_elapsed:.3f} sec"
+    )
+
+    print(
+        "Historical bootstrap ready."
+    )
+
     print("=" * 70)
     print()
 
-    store = LiveCandleStore(max_candles=max_candles)
+    # ---------------------------------------------------------------
+    # BUILD LIVE CANDLE STORE
+    # ---------------------------------------------------------------
+
+    store_started = _time.perf_counter()
+
+    store = LiveCandleStore(
+        max_candles=max_candles
+    )
+
     for candle in candles[-max_candles:]:
         store.add_candle(candle)
 
+    store_elapsed = (
+        _time.perf_counter()
+        - store_started
+    )
+
+    print(
+        f"[TIMING] Store creation: "
+        f"{store_elapsed:.3f} sec"
+    )
+
     return store
+
+
+def refresh_intraday_candles(
+    symbol: str,
+    interval: str,
+    instrument_key: str,
+    store: LiveCandleStore,
+    max_candles: int = 200,
+) -> int:
+    """
+    Refresh today's intraday candles without blocking
+    historical bootstrap.
+
+    Returns the number of new/updated completed candles
+    added to `store`.
+
+    A slow/empty intraday request is intentionally non-fatal
+    because the historical dataset is already sufficient for
+    initial analysis.
+    """
+    refresh_started = _time.perf_counter()
+
+    interval = interval.strip().lower()
+
+    if interval not in SUPPORTED_INTERVALS:
+        raise ValueError(
+            f"Unsupported interval '{interval}'. "
+            f"Supported intervals: "
+            f"{list(SUPPORTED_INTERVALS)}"
+        )
+
+    cfg = SUPPORTED_INTERVALS[interval]
+
+    now_ist = datetime.now(IST)
+
+    print()
+    print("-" * 70)
+    print(
+        f"BACKGROUND INTRADAY REFRESH: "
+        f"{symbol} {interval}"
+    )
+    print("-" * 70)
+
+    # ---------------------------------------------------------------
+    # INTRADAY API
+    # ---------------------------------------------------------------
+
+    request_started = _time.perf_counter()
+
+    raw = _fetch_intraday(
+        instrument_key,
+        cfg["unit"],
+        cfg["interval"],
+    )
+
+    request_elapsed = (
+        _time.perf_counter()
+        - request_started
+    )
+
+    print(
+        f"[TIMING] Intraday request: "
+        f"{request_elapsed:.3f} sec"
+    )
+
+    print(
+        f"Intraday candles     : "
+        f"{len(raw)}"
+    )
+
+    if not raw:
+        total_elapsed = (
+            _time.perf_counter()
+            - refresh_started
+        )
+
+        print(
+            "Intraday result empty; "
+            "historical bootstrap remains valid."
+        )
+
+        print(
+            f"[TIMING] Intraday refresh "
+            f"total: {total_elapsed:.3f} sec"
+        )
+
+        print("-" * 70)
+        print()
+
+        return 0
+
+    # ---------------------------------------------------------------
+    # PROCESS INTRADAY DATA
+    # ---------------------------------------------------------------
+
+    processing_started = (
+        _time.perf_counter()
+    )
+
+    completed = _prepare_completed_candles(
+        symbol=symbol,
+        interval=interval,
+        instrument_key=instrument_key,
+        raw_candles=raw,
+        max_candles=max_candles,
+        now_ist=now_ist,
+    )
+
+    processing_elapsed = (
+        _time.perf_counter()
+        - processing_started
+    )
+
+    print(
+        f"[TIMING] Intraday processing: "
+        f"{processing_elapsed:.3f} sec"
+    )
+
+    # ---------------------------------------------------------------
+    # MERGE INTO LIVE STORE
+    # ---------------------------------------------------------------
+
+    merge_started = (
+        _time.perf_counter()
+    )
+
+    before = store.count()
+
+    for candle in completed:
+        store.add_candle(candle)
+
+    after = store.count()
+
+    merge_elapsed = (
+        _time.perf_counter()
+        - merge_started
+    )
+
+    added = max(
+        0,
+        after - before,
+    )
+
+    print(
+        f"Intraday merged      : "
+        f"{len(completed)}"
+    )
+
+    print(
+        f"Store count          : "
+        f"{store.count()}"
+    )
+
+    print(
+        f"[TIMING] Store merge: "
+        f"{merge_elapsed:.3f} sec"
+    )
+
+    total_elapsed = (
+        _time.perf_counter()
+        - refresh_started
+    )
+
+    print(
+        f"[TIMING] Intraday refresh "
+        f"total: {total_elapsed:.3f} sec"
+    )
+
+    print("-" * 70)
+    print()
+
+    return added
